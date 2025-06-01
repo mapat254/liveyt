@@ -151,17 +151,17 @@ def main():
                     )
                     thread.daemon = True
                     thread.start()
-                    st.experimental_rerun()
+                    st.rerun()
             
             elif row['Status'] == 'Sedang Live':
                 if cols[5].button("Stop", key=f"stop_{i}"):
                     stop_stream(i)
-                    st.experimental_rerun()
+                    st.rerun()
             
             elif row['Status'] in ['Selesai', 'Dihentikan', 'Error']:
                 if cols[5].button("Remove", key=f"remove_{i}"):
                     st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
-                    st.experimental_rerun()
+                    st.rerun()
         
         st.markdown("---")
     
@@ -213,7 +213,7 @@ def main():
                 
                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
                 st.success(f"Added stream for {video_filename}")
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error("Please provide a video path")
     
