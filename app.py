@@ -1,11 +1,19 @@
-import streamlit as st
-import pandas as pd
-import datetime
-import os
+import sys
 import subprocess
 import threading
 import time
+import os
+import streamlit.components.v1 as components
 import shutil
+import datetime
+import pandas as pd
+
+# Install streamlit if not already installed
+try:
+    import streamlit as st
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "streamlit"])
+    import streamlit as st
 
 def check_ffmpeg():
     """Check if ffmpeg is installed and available"""
@@ -22,60 +30,109 @@ def check_ffmpeg():
         return False
     return True
 
-def stream_video_thread(video_path, streaming_url, row_id):
-    """Thread function to stream video"""
+def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
+    """Stream a video file to RTMP server using ffmpeg"""
+    output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+    
+    # Build command with appropriate settings
+    cmd = [
+        "ffmpeg", 
+        "-re",                  # Read input at native frame rate
+        "-stream_loop", "-1",   # Loop the video indefinitely
+        "-i", video_path,       # Input file
+        "-c:v", "libx264",      # Video codec
+        "-preset", "veryfast",  # Encoding preset
+        "-b:v", "2500k",        # Video bitrate
+        "-maxrate", "2500k",    # Maximum bitrate
+        "-bufsize", "5000k",    # Buffer size
+        "-g", "60",             # GOP size
+        "-keyint_min", "60",    # Minimum GOP size
+        "-c:a", "aac",          # Audio codec
+        "-b:a", "128k",         # Audio bitrate
+        "-f", "flv"             # Output format
+    ]
+    
+    # Add scale filter for shorts if needed
+    if is_shorts:
+        cmd += ["-vf", "scale=720:1280"]
+    
+    # Add output URL
+    cmd.append(output_url)
+    
+    # Log the command
+    if log_callback:
+        log_callback(f"Running: {' '.join(cmd)}")
+    
     try:
-        # Command to stream video using ffmpeg
-        command = [
-            'ffmpeg',
-            '-re',  # Read input at native frame rate
-            '-i', video_path,  # Input file
-            '-c:v', 'libx264',  # Video codec
-            '-preset', 'veryfast',  # Encoding preset
-            '-c:a', 'aac',  # Audio codec
-            '-f', 'flv',  # Output format
-            streaming_url  # RTMP URL with streaming key
-        ]
-        
         # Start the process
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         
         # Store process ID for later reference
         with open(f"stream_{row_id}.pid", "w") as f:
             f.write(str(process.pid))
         
-        # Write status file to indicate streaming has started
+        # Update status
         with open(f"stream_{row_id}.status", "w") as f:
             f.write("streaming")
+        
+        # Read and log output
+        if log_callback:
+            for line in process.stdout:
+                log_callback(line.strip())
+                # Also write to log file for debugging
+                with open(f"stream_{row_id}.log", "a") as f:
+                    f.write(line)
         
         # Wait for process to complete
         process.wait()
         
-        # Update status file when done
+        # Update status when done
         with open(f"stream_{row_id}.status", "w") as f:
             f.write("completed")
         
-        # Clean up PID file
-        if os.path.exists(f"stream_{row_id}.pid"):
-            os.remove(f"stream_{row_id}.pid")
-            
+        if log_callback:
+            log_callback("Streaming completed.")
+        
     except Exception as e:
+        error_msg = f"Error: {str(e)}"
+        if log_callback:
+            log_callback(error_msg)
+        
         # Write error to status file
         with open(f"stream_{row_id}.status", "w") as f:
             f.write(f"error: {str(e)}")
+    
+    finally:
+        if log_callback:
+            log_callback("Streaming finished or stopped.")
         
         # Clean up PID file
         if os.path.exists(f"stream_{row_id}.pid"):
             os.remove(f"stream_{row_id}.pid")
 
-def start_stream(video_path, streaming_url, row_id):
+def start_stream(video_path, stream_key, is_shorts, row_id):
     """Start a stream in a separate thread"""
+    # Create logs list for this stream
+    if 'logs' not in st.session_state:
+        st.session_state.logs = {}
+    
+    if row_id not in st.session_state.logs:
+        st.session_state.logs[row_id] = []
+    
+    # Define log callback function
+    def log_callback(msg):
+        if row_id in st.session_state.logs:
+            st.session_state.logs[row_id].append(msg)
+            # Keep only the last 100 log entries
+            if len(st.session_state.logs[row_id]) > 100:
+                st.session_state.logs[row_id] = st.session_state.logs[row_id][-100:]
+    
     # Create a thread for streaming
     thread = threading.Thread(
-        target=stream_video_thread,
-        args=(video_path, streaming_url, row_id)
+        target=run_ffmpeg,
+        args=(video_path, stream_key, is_shorts, row_id, log_callback),
+        daemon=True
     )
-    thread.daemon = True
     thread.start()
     
     # Update status immediately
@@ -97,8 +154,11 @@ def stop_stream(row_id):
                 pid = int(f.read().strip())
             
             # Try to terminate the process
-            import signal
-            os.kill(pid, signal.SIGTERM)
+            if os.name == 'nt':  # Windows
+                os.system(f"taskkill /F /PID {pid}")
+            else:  # Unix/Linux/Mac
+                import signal
+                os.kill(pid, signal.SIGTERM)
             
             # Update status
             st.session_state.streams.loc[row_id, 'Status'] = 'Dihentikan'
@@ -115,7 +175,13 @@ def stop_stream(row_id):
             st.error(f"Error stopping stream: {str(e)}")
             return False
     else:
-        # No PID file, assume stream is not running
+        # No PID file, try to kill all ffmpeg processes (fallback)
+        if os.name == 'nt':  # Windows
+            os.system("taskkill /F /IM ffmpeg.exe")
+        else:  # Unix/Linux/Mac
+            os.system("pkill ffmpeg")
+        
+        # Update status
         st.session_state.streams.loc[row_id, 'Status'] = 'Dihentikan'
         return True
 
@@ -143,24 +209,15 @@ def check_scheduled_streams():
     for idx, row in st.session_state.streams.iterrows():
         if row['Status'] == 'Menunggu' and row['Jam Mulai'] == current_time:
             # Start the stream
-            rtmp_url = f"{st.session_state.rtmp_server}{row['Streaming Key']}"
-            start_stream(row['Video'], rtmp_url, idx)
+            start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx)
 
 def main():
-    st.set_page_config(page_title="Live Streaming Scheduler", layout="wide")
-    
-    # Custom CSS
-    st.markdown("""
-    <style>
-    .main {
-        background-color: #f0f2f6;
-    }
-    .stButton button {
-        background-color: #f0f2f6;
-        color: black;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    # Page configuration must be the first Streamlit command
+    st.set_page_config(
+        page_title="Live Streaming Scheduler",
+        page_icon="📈",
+        layout="wide"
+    )
     
     st.title("Live Streaming Scheduler")
     
@@ -168,118 +225,122 @@ def main():
     if not check_ffmpeg():
         return
     
+    # Bagian iklan
+    show_ads = st.sidebar.checkbox("Tampilkan Iklan", value=False)
+    if show_ads:
+        st.sidebar.subheader("Iklan Sponsor")
+        components.html(
+            """
+            <div style="background:#f0f2f6;padding:20px;border-radius:10px;text-align:center">
+                <script type='text/javascript' 
+                        src='//pl26562103.profitableratecpm.com/28/f9/95/28f9954a1d5bbf4924abe123c76a68d2.js'>
+                </script>
+                <p style="color:#888">Iklan akan muncul di sini</p>
+            </div>
+            """,
+            height=300
+        )
+    
     # Initialize session state
     if 'streams' not in st.session_state:
         st.session_state.streams = pd.DataFrame(columns=[
-            'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Aksi'
+            'Video', 'Durasi', 'Jam Mulai', 'Streaming Key', 'Status', 'Is Shorts'
         ])
-    
-    if 'rtmp_server' not in st.session_state:
-        st.session_state.rtmp_server = "rtmp://a.rtmp.youtube.com/live2/"  # Default YouTube RTMP
     
     # Check status of running streams
     check_stream_statuses()
     
-    # RTMP server configuration
-    with st.expander("RTMP Server Configuration"):
-        rtmp_options = {
-            "YouTube": "rtmp://a.rtmp.youtube.com/live2/",
-            "Facebook": "rtmp://live-api-s.facebook.com:80/rtmp/",
-            "Twitch": "rtmp://live.twitch.tv/app/",
-            "Custom": "custom"
-        }
-        
-        selected_service = st.selectbox(
-            "Streaming Service", 
-            options=list(rtmp_options.keys()),
-            index=0
-        )
-        
-        if selected_service == "Custom":
-            custom_rtmp = st.text_input("Custom RTMP URL", value=st.session_state.rtmp_server)
-            if custom_rtmp:
-                st.session_state.rtmp_server = custom_rtmp
-        else:
-            st.session_state.rtmp_server = rtmp_options[selected_service]
-        
-        st.write(f"Current RTMP Server: {st.session_state.rtmp_server}")
-    
     # Check for scheduled streams
     check_scheduled_streams()
     
-    # Display the streams table with action buttons
-    if not st.session_state.streams.empty:
-        # Create a header row
-        header_cols = st.columns([2, 1, 1, 3, 2, 2])
-        header_cols[0].write("**Video**")
-        header_cols[1].write("**Duration**")
-        header_cols[2].write("**Start Time**")
-        header_cols[3].write("**Streaming Key**")
-        header_cols[4].write("**Status**")
-        header_cols[5].write("**Action**")
+    # Create tabs for different sections
+    tab1, tab2, tab3 = st.tabs(["Stream Manager", "Add New Stream", "Logs"])
+    
+    with tab1:
+        st.subheader("Manage Streams")
         
-        # Display each stream
-        for i, row in st.session_state.streams.iterrows():
-            cols = st.columns([2, 1, 1, 3, 2, 2])
-            cols[0].write(os.path.basename(row['Video']))  # Just show filename
-            cols[1].write(row['Durasi'])
-            cols[2].write(row['Jam Mulai'])
-            cols[3].write(row['Streaming Key'])
-            cols[4].write(row['Status'])
+        # Display the streams table with action buttons
+        if not st.session_state.streams.empty:
+            # Create a header row
+            header_cols = st.columns([2, 1, 1, 2, 2, 2])
+            header_cols[0].write("**Video**")
+            header_cols[1].write("**Duration**")
+            header_cols[2].write("**Start Time**")
+            header_cols[3].write("**Streaming Key**")
+            header_cols[4].write("**Status**")
+            header_cols[5].write("**Action**")
             
-            # Action buttons
-            if row['Status'] == 'Menunggu':
-                if cols[5].button("Start", key=f"start_{i}"):
-                    rtmp_url = f"{st.session_state.rtmp_server}{row['Streaming Key']}"
-                    if start_stream(row['Video'], rtmp_url, i):
+            # Display each stream
+            for i, row in st.session_state.streams.iterrows():
+                cols = st.columns([2, 1, 1, 2, 2, 2])
+                cols[0].write(os.path.basename(row['Video']))  # Just show filename
+                cols[1].write(row['Durasi'])
+                cols[2].write(row['Jam Mulai'])
+                # Mask streaming key for security
+                masked_key = row['Streaming Key'][:4] + "****" if len(row['Streaming Key']) > 4 else "****"
+                cols[3].write(masked_key)
+                cols[4].write(row['Status'])
+                
+                # Action buttons
+                if row['Status'] == 'Menunggu':
+                    if cols[5].button("Start", key=f"start_{i}"):
+                        if start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), i):
+                            st.rerun()
+                
+                elif row['Status'] == 'Sedang Live':
+                    if cols[5].button("Stop", key=f"stop_{i}"):
+                        if stop_stream(i):
+                            st.rerun()
+                
+                elif row['Status'] in ['Selesai', 'Dihentikan'] or row['Status'].startswith('error:'):
+                    if cols[5].button("Remove", key=f"remove_{i}"):
+                        st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
+                        # Also remove log entries
+                        if 'logs' in st.session_state and i in st.session_state.logs:
+                            del st.session_state.logs[i]
                         st.rerun()
-            
-            elif row['Status'] == 'Sedang Live':
-                if cols[5].button("Stop", key=f"stop_{i}"):
-                    if stop_stream(i):
-                        st.rerun()
-            
-            elif row['Status'] in ['Selesai', 'Dihentikan'] or row['Status'].startswith('error:'):
-                if cols[5].button("Remove", key=f"remove_{i}"):
-                    st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
-                    st.rerun()
+        else:
+            st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
+    
+    with tab2:
+        st.subheader("Add New Stream")
         
-        st.markdown("---")
-    
-    # Form for adding new streams
-    st.subheader("Add New Stream")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        video_path = st.text_input("Video Path", placeholder="Full path to video file")
+        # List available video files
+        video_files = [f for f in os.listdir('.') if f.endswith(('.mp4', '.flv', '.avi', '.mov', '.mkv'))]
         
-        # File uploader as an alternative
-        uploaded_file = st.file_uploader("Or upload a video", type=['mp4', 'avi', 'mov', 'mkv'])
-        if uploaded_file:
-            # Save the uploaded file
-            temp_dir = "temp_uploads"
-            os.makedirs(temp_dir, exist_ok=True)
-            temp_path = os.path.join(temp_dir, uploaded_file.name)
-            
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            video_path = temp_path
-    
-    with col2:
-        duration = st.text_input("Duration (HH:MM:SS)", value="01:00:00")
+        col1, col2 = st.columns(2)
         
-        # Time picker for start time
-        now = datetime.datetime.now()
-        start_time = st.time_input("Start Time", value=now)
-        start_time_str = start_time.strftime("%H:%M")
-    
-    with col3:
-        streaming_key = st.text_input("Streaming Key", placeholder="Enter your streaming key")
+        with col1:
+            st.write("Video yang tersedia:")
+            selected_video = st.selectbox("Pilih video", [""] + video_files) if video_files else None
+            
+            uploaded_file = st.file_uploader("Atau upload video baru", type=['mp4', 'flv', 'avi', 'mov', 'mkv'])
+            
+            if uploaded_file:
+                # Save the uploaded file
+                with open(uploaded_file.name, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                st.success("Video berhasil diupload!")
+                video_path = uploaded_file.name
+            elif selected_video:
+                video_path = selected_video
+            else:
+                video_path = None
+        
+        with col2:
+            stream_key = st.text_input("Stream Key", type="password")
+            
+            # Time picker for start time
+            now = datetime.datetime.now()
+            start_time = st.time_input("Start Time", value=now)
+            start_time_str = start_time.strftime("%H:%M")
+            
+            duration = st.text_input("Duration (HH:MM:SS)", value="01:00:00")
+            
+            is_shorts = st.checkbox("Mode Shorts (720x1280)")
         
         if st.button("Add Stream"):
-            if video_path and streaming_key:
+            if video_path and stream_key:
                 # Get just the filename from the path
                 video_filename = os.path.basename(video_path)
                 
@@ -287,9 +348,9 @@ def main():
                     'Video': [video_path],
                     'Durasi': [duration],
                     'Jam Mulai': [start_time_str],
-                    'Streaming Key': [streaming_key],
+                    'Streaming Key': [stream_key],
                     'Status': ['Menunggu'],
-                    'Aksi': ['']
+                    'Is Shorts': [is_shorts]
                 })
                 
                 st.session_state.streams = pd.concat([st.session_state.streams, new_stream], ignore_index=True)
@@ -298,33 +359,66 @@ def main():
             else:
                 if not video_path:
                     st.error("Please provide a video path")
-                if not streaming_key:
+                if not stream_key:
                     st.error("Please provide a streaming key")
     
+    with tab3:
+        st.subheader("Stream Logs")
+        
+        # Select stream to view logs
+        if 'logs' in st.session_state and st.session_state.logs:
+            stream_options = {}
+            for idx, row in st.session_state.streams.iterrows():
+                if idx in st.session_state.logs:
+                    stream_options[f"{os.path.basename(row['Video'])} (ID: {idx})"] = idx
+            
+            if stream_options:
+                selected_stream = st.selectbox("Select stream to view logs", options=list(stream_options.keys()))
+                selected_id = stream_options[selected_stream]
+                
+                # Display logs
+                log_container = st.container()
+                with log_container:
+                    st.code("\n".join(st.session_state.logs[selected_id]))
+                
+                # Auto-refresh option
+                auto_refresh = st.checkbox("Auto-refresh logs", value=True)
+                if auto_refresh:
+                    time.sleep(2)  # Wait 2 seconds
+                    st.rerun()
+            else:
+                st.info("No logs available. Start a stream to see logs.")
+        else:
+            st.info("No logs available. Start a stream to see logs.")
+    
     # Instructions
-    with st.expander("How to use"):
+    with st.sidebar.expander("How to use"):
         st.markdown("""
         ### Instructions:
         
-        1. **Configure RTMP Server**: Select your streaming platform (YouTube, Facebook, etc.)
-        2. **Add Streams**: Provide the video path, duration, start time, and streaming key
-        3. **Streaming Keys**:
-           - For YouTube: Use your stream key from YouTube Studio
-           - For Facebook: Use your stream key from Facebook Live Producer
-           - For Twitch: Use your stream key from Twitch Dashboard
+        1. **Add a Stream**: 
+           - Select or upload a video
+           - Enter your YouTube stream key
+           - Set start time and duration
+           - Check "Mode Shorts" for vertical videos
+        
+        2. **Manage Streams**:
+           - Start/stop streams manually
+           - Streams will start automatically at scheduled time
+           - View logs to monitor streaming status
         
         ### Requirements:
         
-        - FFmpeg must be installed on your system and available in PATH
+        - FFmpeg must be installed on your system
         - Videos must be in a compatible format (MP4 recommended)
         - Your network must allow outbound RTMP traffic
         
         ### Notes:
         
-        - Streams scheduled for a specific time will start automatically
-        - You can manually start/stop streams using the action buttons
+        - For YouTube Shorts, use vertical videos (9:16 aspect ratio)
+        - Stream keys are sensitive information - keep them private
         - Multiple streams can run simultaneously, but this requires significant CPU and bandwidth
         """)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
