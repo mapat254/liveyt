@@ -3,3 +3,5 @@ ffmpeg
 opencv-python-headless
 pillow
 numpy
+ffmpeg-python
+pytube
