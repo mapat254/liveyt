@@ -30,9 +30,14 @@ def check_ffmpeg():
         return False
     return True
 
-def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
+def run_ffmpeg(video_path, stream_key, is_shorts, row_id):
     """Stream a video file to RTMP server using ffmpeg"""
     output_url = f"rtmp://a.rtmp.youtube.com/live2/{stream_key}"
+    
+    # Create log file
+    log_file = f"stream_{row_id}.log"
+    with open(log_file, "w") as f:
+        f.write(f"Starting stream for {video_path} at {datetime.datetime.now()}\n")
     
     # Build command with appropriate settings
     cmd = [
@@ -60,12 +65,18 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
     cmd.append(output_url)
     
     # Log the command
-    if log_callback:
-        log_callback(f"Running: {' '.join(cmd)}")
+    with open(log_file, "a") as f:
+        f.write(f"Running: {' '.join(cmd)}\n")
     
     try:
         # Start the process
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        process = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT, 
+            text=True,
+            bufsize=1  # Line buffered
+        )
         
         # Store process ID for later reference
         with open(f"stream_{row_id}.pid", "w") as f:
@@ -76,12 +87,9 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
             f.write("streaming")
         
         # Read and log output
-        if log_callback:
-            for line in process.stdout:
-                log_callback(line.strip())
-                # Also write to log file for debugging
-                with open(f"stream_{row_id}.log", "a") as f:
-                    f.write(line)
+        for line in process.stdout:
+            with open(log_file, "a") as f:
+                f.write(line)
         
         # Wait for process to complete
         process.wait()
@@ -90,21 +98,23 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
         with open(f"stream_{row_id}.status", "w") as f:
             f.write("completed")
         
-        if log_callback:
-            log_callback("Streaming completed.")
+        with open(log_file, "a") as f:
+            f.write("Streaming completed.\n")
         
     except Exception as e:
         error_msg = f"Error: {str(e)}"
-        if log_callback:
-            log_callback(error_msg)
+        
+        # Write error to log file
+        with open(log_file, "a") as f:
+            f.write(f"{error_msg}\n")
         
         # Write error to status file
         with open(f"stream_{row_id}.status", "w") as f:
             f.write(f"error: {str(e)}")
     
     finally:
-        if log_callback:
-            log_callback("Streaming finished or stopped.")
+        with open(log_file, "a") as f:
+            f.write("Streaming finished or stopped.\n")
         
         # Clean up PID file
         if os.path.exists(f"stream_{row_id}.pid"):
@@ -112,25 +122,10 @@ def run_ffmpeg(video_path, stream_key, is_shorts, row_id, log_callback=None):
 
 def start_stream(video_path, stream_key, is_shorts, row_id):
     """Start a stream in a separate thread"""
-    # Create logs list for this stream
-    if 'logs' not in st.session_state:
-        st.session_state.logs = {}
-    
-    if row_id not in st.session_state.logs:
-        st.session_state.logs[row_id] = []
-    
-    # Define log callback function
-    def log_callback(msg):
-        if row_id in st.session_state.logs:
-            st.session_state.logs[row_id].append(msg)
-            # Keep only the last 100 log entries
-            if len(st.session_state.logs[row_id]) > 100:
-                st.session_state.logs[row_id] = st.session_state.logs[row_id][-100:]
-    
     # Create a thread for streaming
     thread = threading.Thread(
         target=run_ffmpeg,
-        args=(video_path, stream_key, is_shorts, row_id, log_callback),
+        args=(video_path, stream_key, is_shorts, row_id),
         daemon=True
     )
     thread.start()
@@ -210,6 +205,15 @@ def check_scheduled_streams():
         if row['Status'] == 'Menunggu' and row['Jam Mulai'] == current_time:
             # Start the stream
             start_stream(row['Video'], row['Streaming Key'], row.get('Is Shorts', False), idx)
+
+def get_stream_logs(row_id, max_lines=100):
+    """Get logs for a specific stream"""
+    log_file = f"stream_{row_id}.log"
+    if os.path.exists(log_file):
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+        return lines[-max_lines:] if len(lines) > max_lines else lines
+    return []
 
 def main():
     # Page configuration must be the first Streamlit command
@@ -295,9 +299,10 @@ def main():
                 elif row['Status'] in ['Selesai', 'Dihentikan'] or row['Status'].startswith('error:'):
                     if cols[5].button("Remove", key=f"remove_{i}"):
                         st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
-                        # Also remove log entries
-                        if 'logs' in st.session_state and i in st.session_state.logs:
-                            del st.session_state.logs[i]
+                        # Also remove log file if it exists
+                        log_file = f"stream_{i}.log"
+                        if os.path.exists(log_file):
+                            os.remove(log_file)
                         st.rerun()
         else:
             st.info("No streams added yet. Use the 'Add New Stream' tab to add a stream.")
@@ -365,21 +370,27 @@ def main():
     with tab3:
         st.subheader("Stream Logs")
         
-        # Select stream to view logs
-        if 'logs' in st.session_state and st.session_state.logs:
+        # Get all stream IDs that have log files
+        log_files = [f for f in os.listdir('.') if f.startswith('stream_') and f.endswith('.log')]
+        stream_ids = [int(f.split('_')[1].split('.')[0]) for f in log_files]
+        
+        if stream_ids:
+            # Create options for selectbox
             stream_options = {}
-            for idx, row in st.session_state.streams.iterrows():
-                if idx in st.session_state.logs:
-                    stream_options[f"{os.path.basename(row['Video'])} (ID: {idx})"] = idx
+            for idx in stream_ids:
+                if idx in st.session_state.streams.index:
+                    video_name = os.path.basename(st.session_state.streams.loc[idx, 'Video'])
+                    stream_options[f"{video_name} (ID: {idx})"] = idx
             
             if stream_options:
                 selected_stream = st.selectbox("Select stream to view logs", options=list(stream_options.keys()))
                 selected_id = stream_options[selected_stream]
                 
                 # Display logs
+                logs = get_stream_logs(selected_id)
                 log_container = st.container()
                 with log_container:
-                    st.code("\n".join(st.session_state.logs[selected_id]))
+                    st.code("".join(logs))
                 
                 # Auto-refresh option
                 auto_refresh = st.checkbox("Auto-refresh logs", value=True)
