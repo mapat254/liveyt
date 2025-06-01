@@ -8,11 +8,11 @@ import subprocess
 import threading
 import time
 import uuid
+import queue
 
-def generate_streaming_key(length=12):
-    """Generate a random streaming key"""
-    chars = string.ascii_lowercase + string.digits + '-'
-    return ''.join(random.choice(chars) for _ in range(length))
+# Create a thread-safe queue for status updates
+if 'status_queue' not in st.session_state:
+    st.session_state.status_queue = queue.Queue()
 
 def stream_video(video_path, streaming_url, row_id):
     """Stream a video file to RTMP server using ffmpeg"""
@@ -32,24 +32,44 @@ def stream_video(video_path, streaming_url, row_id):
         # Start the process
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
-        # Update status to streaming
-        st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
-        st.session_state.stream_processes[row_id] = process
+        # Update status to streaming (via queue)
+        st.session_state.status_queue.put(('start', row_id, process))
         
         # Wait for process to complete
         process.wait()
         
-        # Update status when done
-        if row_id in st.session_state.streams.index:
-            st.session_state.streams.loc[row_id, 'Status'] = 'Selesai'
-            if row_id in st.session_state.stream_processes:
-                del st.session_state.stream_processes[row_id]
+        # Update status when done (via queue)
+        st.session_state.status_queue.put(('complete', row_id, None))
     
     except Exception as e:
-        if row_id in st.session_state.streams.index:
-            st.session_state.streams.loc[row_id, 'Status'] = f'Error: {str(e)}'
-        if row_id in st.session_state.stream_processes:
-            del st.session_state.stream_processes[row_id]
+        # Update status on error (via queue)
+        st.session_state.status_queue.put(('error', row_id, str(e)))
+
+def process_status_updates():
+    """Process any status updates from the queue"""
+    if 'status_queue' in st.session_state:
+        try:
+            while not st.session_state.status_queue.empty():
+                status, row_id, data = st.session_state.status_queue.get(block=False)
+                
+                if status == 'start':
+                    if row_id in st.session_state.streams.index:
+                        st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
+                        st.session_state.stream_processes[row_id] = data  # data is the process
+                
+                elif status == 'complete':
+                    if row_id in st.session_state.streams.index:
+                        st.session_state.streams.loc[row_id, 'Status'] = 'Selesai'
+                        if row_id in st.session_state.stream_processes:
+                            del st.session_state.stream_processes[row_id]
+                
+                elif status == 'error':
+                    if row_id in st.session_state.streams.index:
+                        st.session_state.streams.loc[row_id, 'Status'] = f'Error: {data}'  # data is the error message
+                        if row_id in st.session_state.stream_processes:
+                            del st.session_state.stream_processes[row_id]
+        except Exception:
+            pass  # Ignore any queue processing errors
 
 def stop_stream(row_id):
     """Stop a running stream"""
@@ -103,6 +123,9 @@ def main():
     
     if 'rtmp_server' not in st.session_state:
         st.session_state.rtmp_server = "rtmp://a.rtmp.youtube.com/live2/"  # Default YouTube RTMP
+    
+    # Process any status updates from threads
+    process_status_updates()
     
     # RTMP server configuration
     with st.expander("RTMP Server Configuration"):
@@ -195,10 +218,10 @@ def main():
         start_time_str = start_time.strftime("%H:%M")
     
     with col3:
-        streaming_key = st.text_input("Streaming Key", value=generate_streaming_key())
+        streaming_key = st.text_input("Streaming Key", placeholder="Enter your streaming key")
         
         if st.button("Add Stream"):
-            if video_path:
+            if video_path and streaming_key:
                 # Get just the filename from the path
                 video_filename = os.path.basename(video_path)
                 
@@ -215,7 +238,10 @@ def main():
                 st.success(f"Added stream for {video_filename}")
                 st.rerun()
             else:
-                st.error("Please provide a video path")
+                if not video_path:
+                    st.error("Please provide a video path")
+                if not streaming_key:
+                    st.error("Please provide a streaming key")
     
     # Instructions
     with st.expander("How to use"):
