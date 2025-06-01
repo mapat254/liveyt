@@ -8,11 +8,22 @@ import subprocess
 import threading
 import time
 import uuid
-import queue
+import shutil
 
-# Create a thread-safe queue for status updates
-if 'status_queue' not in st.session_state:
-    st.session_state.status_queue = queue.Queue()
+def check_ffmpeg():
+    """Check if ffmpeg is installed and available"""
+    ffmpeg_path = shutil.which('ffmpeg')
+    if not ffmpeg_path:
+        st.error("FFmpeg is not installed or not in PATH. Please install FFmpeg to use this application.")
+        st.markdown("""
+        ### How to install FFmpeg:
+        
+        - **Ubuntu/Debian**: `sudo apt-get install ffmpeg`
+        - **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
+        - **macOS**: `brew install ffmpeg`
+        """)
+        return False
+    return True
 
 def stream_video(video_path, streaming_url, row_id):
     """Stream a video file to RTMP server using ffmpeg"""
@@ -32,44 +43,19 @@ def stream_video(video_path, streaming_url, row_id):
         # Start the process
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
-        # Update status to streaming (via queue)
-        st.session_state.status_queue.put(('start', row_id, process))
+        # Store the process in a global variable that we'll check later
+        if 'stream_processes' in st.session_state:
+            st.session_state.stream_processes[row_id] = process
         
         # Wait for process to complete
         process.wait()
         
-        # Update status when done (via queue)
-        st.session_state.status_queue.put(('complete', row_id, None))
+        # We can't safely update session state from a thread
+        # The main thread will check process status
     
     except Exception as e:
-        # Update status on error (via queue)
-        st.session_state.status_queue.put(('error', row_id, str(e)))
-
-def process_status_updates():
-    """Process any status updates from the queue"""
-    if 'status_queue' in st.session_state:
-        try:
-            while not st.session_state.status_queue.empty():
-                status, row_id, data = st.session_state.status_queue.get(block=False)
-                
-                if status == 'start':
-                    if row_id in st.session_state.streams.index:
-                        st.session_state.streams.loc[row_id, 'Status'] = 'Sedang Live'
-                        st.session_state.stream_processes[row_id] = data  # data is the process
-                
-                elif status == 'complete':
-                    if row_id in st.session_state.streams.index:
-                        st.session_state.streams.loc[row_id, 'Status'] = 'Selesai'
-                        if row_id in st.session_state.stream_processes:
-                            del st.session_state.stream_processes[row_id]
-                
-                elif status == 'error':
-                    if row_id in st.session_state.streams.index:
-                        st.session_state.streams.loc[row_id, 'Status'] = f'Error: {data}'  # data is the error message
-                        if row_id in st.session_state.stream_processes:
-                            del st.session_state.stream_processes[row_id]
-        except Exception:
-            pass  # Ignore any queue processing errors
+        # Just print the error, don't try to access session state
+        print(f"Error in stream: {str(e)}")
 
 def stop_stream(row_id):
     """Stop a running stream"""
@@ -93,6 +79,25 @@ def check_scheduled_streams():
             )
             thread.daemon = True
             thread.start()
+            
+            # Update status in the main thread
+            st.session_state.streams.loc[idx, 'Status'] = 'Sedang Live'
+
+def check_stream_status():
+    """Check the status of running streams"""
+    for idx in list(st.session_state.stream_processes.keys()):
+        process = st.session_state.stream_processes[idx]
+        
+        # Check if process has completed
+        if process.poll() is not None:
+            # Check if process exited with an error
+            if process.returncode != 0:
+                stderr = process.stderr.read().decode('utf-8')
+                st.session_state.streams.loc[idx, 'Status'] = f'Error: FFmpeg exited with code {process.returncode}'
+            else:
+                st.session_state.streams.loc[idx, 'Status'] = 'Selesai'
+            
+            del st.session_state.stream_processes[idx]
 
 def main():
     st.set_page_config(page_title="Live Streaming Scheduler", layout="wide")
@@ -112,6 +117,10 @@ def main():
     
     st.title("Live Streaming Scheduler")
     
+    # Check if ffmpeg is installed
+    if not check_ffmpeg():
+        return
+    
     # Initialize session state
     if 'streams' not in st.session_state:
         st.session_state.streams = pd.DataFrame(columns=[
@@ -124,8 +133,8 @@ def main():
     if 'rtmp_server' not in st.session_state:
         st.session_state.rtmp_server = "rtmp://a.rtmp.youtube.com/live2/"  # Default YouTube RTMP
     
-    # Process any status updates from threads
-    process_status_updates()
+    # Check status of running streams
+    check_stream_status()
     
     # RTMP server configuration
     with st.expander("RTMP Server Configuration"):
@@ -156,9 +165,19 @@ def main():
     
     # Display the streams table with action buttons
     if not st.session_state.streams.empty:
+        # Create a header row
+        header_cols = st.columns([2, 1, 1, 3, 2, 2])
+        header_cols[0].write("**Video**")
+        header_cols[1].write("**Duration**")
+        header_cols[2].write("**Start Time**")
+        header_cols[3].write("**Streaming Key**")
+        header_cols[4].write("**Status**")
+        header_cols[5].write("**Action**")
+        
+        # Display each stream
         for i, row in st.session_state.streams.iterrows():
             cols = st.columns([2, 1, 1, 3, 2, 2])
-            cols[0].write(row['Video'])
+            cols[0].write(os.path.basename(row['Video']))  # Just show filename
             cols[1].write(row['Durasi'])
             cols[2].write(row['Jam Mulai'])
             cols[3].write(row['Streaming Key'])
@@ -174,6 +193,9 @@ def main():
                     )
                     thread.daemon = True
                     thread.start()
+                    
+                    # Update status in the main thread
+                    st.session_state.streams.loc[i, 'Status'] = 'Sedang Live'
                     st.rerun()
             
             elif row['Status'] == 'Sedang Live':
@@ -181,7 +203,7 @@ def main():
                     stop_stream(i)
                     st.rerun()
             
-            elif row['Status'] in ['Selesai', 'Dihentikan', 'Error']:
+            elif row['Status'] in ['Selesai', 'Dihentikan'] or row['Status'].startswith('Error'):
                 if cols[5].button("Remove", key=f"remove_{i}"):
                     st.session_state.streams = st.session_state.streams.drop(i).reset_index(drop=True)
                     st.rerun()
