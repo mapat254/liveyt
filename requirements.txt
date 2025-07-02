@@ -5,3 +5,5 @@ pillow
 numpy
 ffmpeg-python
 pytube
+pandas
+psutil
